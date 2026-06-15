@@ -1,0 +1,108 @@
+name: Telegram Poll
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll Telegram and update links
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          set -e
+          LINKS_FILE="links.json"
+
+          LAST_UPDATE_ID=$(jq -r '._last_update_id // 0' "$LINKS_FILE")
+          OFFSET=$((LAST_UPDATE_ID + 1))
+          echo "Fetching updates with offset: $OFFSET"
+
+          RESPONSE=$(curl -sf "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${OFFSET}&limit=100")
+
+          OK=$(echo "$RESPONSE" | jq -r '.ok')
+          if [ "$OK" != "true" ]; then
+            echo "Telegram API error: $RESPONSE"
+            exit 1
+          fi
+
+          UPDATES=$(echo "$RESPONSE" | jq '.result')
+          COUNT=$(echo "$UPDATES" | jq 'length')
+          echo "Got $COUNT updates"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No new updates"
+            exit 0
+          fi
+
+          NEW_LAST_UPDATE_ID=$LAST_UPDATE_ID
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            UPDATE=$(echo "$UPDATES" | jq ".[$i]")
+            UPDATE_ID=$(echo "$UPDATE" | jq -r '.update_id')
+
+            if [ "$UPDATE_ID" -gt "$NEW_LAST_UPDATE_ID" ]; then
+              NEW_LAST_UPDATE_ID=$UPDATE_ID
+            fi
+
+            FROM_ID=$(echo "$UPDATE" | jq -r '.message.from.id // empty')
+            TEXT=$(echo "$UPDATE" | jq -r '.message.text // empty')
+
+            if [ "$FROM_ID" != "$CHAT_ID" ]; then
+              echo "Skipping message from unauthorized user: $FROM_ID"
+              continue
+            fi
+
+            if [ -z "$TEXT" ]; then
+              continue
+            fi
+
+            URL=$(echo "$TEXT" | awk '{print $1}')
+            ANCHOR=$(echo "$TEXT" | cut -d' ' -f2-)
+
+            if [[ ! "$URL" =~ ^https?:// ]]; then
+              echo "Not a URL, skipping: $TEXT"
+              curl -sf "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${FROM_ID}" \
+                --data-urlencode "text=❌ Не розпізнано URL. Надсилай у форматі: https://... Назва" > /dev/null
+              continue
+            fi
+
+            if [ "$ANCHOR" = "$URL" ] || [ -z "$ANCHOR" ]; then
+              ANCHOR="$URL"
+            fi
+
+            echo "Adding link: $URL -> $ANCHOR"
+            TMP=$(mktemp)
+            jq --arg url "$URL" --arg text "$ANCHOR" '.links += [{"url": $url, "text": $text}]' "$LINKS_FILE" > "$TMP"
+            mv "$TMP" "$LINKS_FILE"
+
+            curl -sf "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${FROM_ID}" \
+              --data-urlencode "text=✅ Додано: ${ANCHOR}" > /dev/null
+          done
+
+          TMP=$(mktemp)
+          jq --argjson id "$NEW_LAST_UPDATE_ID" '._last_update_id = $id' "$LINKS_FILE" > "$TMP"
+          mv "$TMP" "$LINKS_FILE"
+
+          echo "Done. Last update ID: $NEW_LAST_UPDATE_ID"
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add links.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update links from Telegram"
+            git push
+          fi
